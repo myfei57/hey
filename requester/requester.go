@@ -91,12 +91,22 @@ type Work struct {
 	// Writer is where results will be written. If nil, results are written to stdout.
 	Writer io.Writer
 
+	// LatencyBucketCap is the fixed number of histogram bins per latency
+	// class used by the streaming percentile aggregator. Zero selects the
+	// default; memory use stays bounded regardless of the number of requests.
+	LatencyBucketCap int
+
 	initOnce sync.Once
 	results  chan *result
 	stopCh   chan struct{}
 	start    time.Duration
 
 	report *report
+
+	// latencies aggregates per-class response latency quantiles. It is
+	// updated concurrently by workers and never feeds the text/CSV report,
+	// so existing report output is unaffected.
+	latencies *LatencyAggregator
 }
 
 func (b *Work) writer() io.Writer {
@@ -111,7 +121,22 @@ func (b *Work) Init() {
 	b.initOnce.Do(func() {
 		b.results = make(chan *result, min(b.C*1000, maxResult))
 		b.stopCh = make(chan struct{}, b.C)
+		if b.latencies == nil {
+			b.latencies = NewLatencyAggregator(b.LatencyBucketCap)
+		}
 	})
+}
+
+// LatencyStats returns deterministic per-class response latency statistics
+// (success, HTTP error, network error, timeout) for the requested
+// percentages. A nil/empty percentages slice uses DefaultPercentiles. The
+// aggregator keeps a fixed memory cap and stores no raw responses; calling
+// this method does not modify the printed/CSV report in any way.
+func (b *Work) LatencyStats(percentages []int) []LatencyClassStats {
+	if b.latencies == nil {
+		return nil
+	}
+	return b.latencies.Stats(percentages)
 }
 
 // Run makes all the requests, prints the summary. It blocks until
@@ -202,6 +227,11 @@ func (b *Work) makeRequest(c *http.Client) {
 		reqDuration:   reqDuration,
 		resDuration:   resDuration,
 		delayDuration: delayDuration,
+	}
+	// Feed the bounded streaming aggregator. Only the latency and the
+	// classification are recorded; no response data is retained.
+	if b.latencies != nil {
+		b.latencies.ObserveResult(err, code, finish)
 	}
 }
 
