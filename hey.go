@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +65,9 @@ var (
 	disableKeepAlives  = flag.Bool("disable-keepalive", false, "")
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
 	proxyAddr          = flag.String("x", "", "")
+
+	targetFlags   targetSlice
+	breakerWindow = flag.Duration("breaker", 30*time.Second, "")
 )
 
 var usage = `Usage: hey [options...] <url>
@@ -101,6 +105,20 @@ Options:
   -disable-redirects    Disable following of HTTP redirects
   -cpus                 Number of used cpu cores.
                         (default for current machine is %d cores)
+
+Multi-target scheduling:
+  -target  Add a weighted target as "URL WEIGHT [MAXCONCURRENT]". The flag
+           can be repeated and enables multi-target fair scheduling, in which
+           case the positional URL is ignored. WEIGHT is a non-negative
+           integer and at least one target must have a positive weight;
+           a zero-weight target receives no traffic. MAXCONCURRENT caps the
+           in-flight requests to that target, 0 (the default) means no cap.
+           Example: -target "http://host-a 3 10" -target "http://host-b 1".
+  -breaker Circuit-breaker window for failing targets in multi-target mode.
+           A failing target (transport error or 5xx) loses all traffic for
+           the window, then receives one probe request; a successful probe
+           restores its weight. 0 disables the circuit breaker.
+           Default is 30s.
 `
 
 func main() {
@@ -110,9 +128,10 @@ func main() {
 
 	var hs headerSlice
 	flag.Var(&hs, "H", "")
+	flag.Var(&targetFlags, "target", "")
 
 	flag.Parse()
-	if flag.NArg() < 1 {
+	if flag.NArg() < 1 && len(targetFlags) == 0 {
 		usageAndExit("")
 	}
 
@@ -137,7 +156,6 @@ func main() {
 		}
 	}
 
-	url := flag.Args()[0]
 	method := strings.ToUpper(*m)
 
 	// set content-type
@@ -191,20 +209,6 @@ func main() {
 		}
 	}
 
-	req, err := http.NewRequest(method, url, nil)
-	if err != nil {
-		usageAndExit(err.Error())
-	}
-	req.ContentLength = int64(len(bodyAll))
-	if username != "" || password != "" {
-		req.SetBasicAuth(username, password)
-	}
-
-	// set host header if set
-	if *hostHeader != "" {
-		req.Host = *hostHeader
-	}
-
 	ua := header.Get("User-Agent")
 	if ua == "" {
 		ua = heyUA
@@ -219,21 +223,81 @@ func main() {
 		header.Set("User-Agent", ua)
 	}
 
-	req.Header = header
+	var w *requester.Work
+	if len(targetFlags) > 0 {
+		positiveWeight := false
+		targets := make([]requester.Target, len(targetFlags))
+		for i, tf := range targetFlags {
+			if tf.weight > 0 {
+				positiveWeight = true
+			}
+			req, err := http.NewRequest(method, tf.url, nil)
+			if err != nil {
+				usageAndExit(err.Error())
+			}
+			req.ContentLength = int64(len(bodyAll))
+			if username != "" || password != "" {
+				req.SetBasicAuth(username, password)
+			}
+			if *hostHeader != "" {
+				req.Host = *hostHeader
+			}
+			req.Header = header
+			targets[i] = requester.Target{
+				Request:       req,
+				Weight:        tf.weight,
+				MaxConcurrent: tf.maxConcurrent,
+			}
+		}
+		if !positiveWeight {
+			usageAndExit("At least one -target must have a positive weight.")
+		}
+		w = &requester.Work{
+			RequestBody:        bodyAll,
+			N:                  num,
+			C:                  conc,
+			QPS:                q,
+			Timeout:            *t,
+			DisableCompression: *disableCompression,
+			DisableKeepAlives:  *disableKeepAlives,
+			DisableRedirects:   *disableRedirects,
+			H2:                 *h2,
+			ProxyAddr:          proxyURL,
+			Output:             *output,
+			Targets:            targets,
+			BreakerWindow:      *breakerWindow,
+		}
+	} else {
+		req, err := http.NewRequest(method, flag.Args()[0], nil)
+		if err != nil {
+			usageAndExit(err.Error())
+		}
+		req.ContentLength = int64(len(bodyAll))
+		if username != "" || password != "" {
+			req.SetBasicAuth(username, password)
+		}
 
-	w := &requester.Work{
-		Request:            req,
-		RequestBody:        bodyAll,
-		N:                  num,
-		C:                  conc,
-		QPS:                q,
-		Timeout:            *t,
-		DisableCompression: *disableCompression,
-		DisableKeepAlives:  *disableKeepAlives,
-		DisableRedirects:   *disableRedirects,
-		H2:                 *h2,
-		ProxyAddr:          proxyURL,
-		Output:             *output,
+		// set host header if set
+		if *hostHeader != "" {
+			req.Host = *hostHeader
+		}
+
+		req.Header = header
+
+		w = &requester.Work{
+			Request:            req,
+			RequestBody:        bodyAll,
+			N:                  num,
+			C:                  conc,
+			QPS:                q,
+			Timeout:            *t,
+			DisableCompression: *disableCompression,
+			DisableKeepAlives:  *disableKeepAlives,
+			DisableRedirects:   *disableRedirects,
+			H2:                 *h2,
+			ProxyAddr:          proxyURL,
+			Output:             *output,
+		}
 	}
 	w.Init()
 
@@ -285,5 +349,43 @@ func (h *headerSlice) String() string {
 
 func (h *headerSlice) Set(value string) error {
 	*h = append(*h, value)
+	return nil
+}
+
+// targetSpec is one parsed -target flag: a URL, its non-negative weight
+// and an optional per-target concurrency cap (0 means no cap).
+type targetSpec struct {
+	url           string
+	weight        int
+	maxConcurrent int
+}
+
+type targetSlice []targetSpec
+
+func (t *targetSlice) String() string {
+	return fmt.Sprintf("%v", *t)
+}
+
+func (t *targetSlice) Set(value string) error {
+	fields := strings.Fields(value)
+	if len(fields) < 2 || len(fields) > 3 {
+		return fmt.Errorf("invalid -target %q, want \"URL WEIGHT [MAXCONCURRENT]\"", value)
+	}
+	weight, err := strconv.Atoi(fields[1])
+	if err != nil || weight < 0 {
+		return fmt.Errorf("invalid -target weight %q, want a non-negative integer", fields[1])
+	}
+	maxConcurrent := 0
+	if len(fields) == 3 {
+		maxConcurrent, err = strconv.Atoi(fields[2])
+		if err != nil || maxConcurrent < 0 {
+			return fmt.Errorf("invalid -target concurrency cap %q, want a non-negative integer", fields[2])
+		}
+	}
+	*t = append(*t, targetSpec{
+		url:           fields[0],
+		weight:        weight,
+		maxConcurrent: maxConcurrent,
+	})
 	return nil
 }

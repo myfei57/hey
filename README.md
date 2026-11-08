@@ -59,6 +59,19 @@ Options:
   -disable-redirects    Disable following of HTTP redirects
   -cpus                 Number of used cpu cores.
                         (default for current machine is 8 cores)
+
+Multi-target scheduling:
+  -target  Add a weighted target as "URL WEIGHT [MAXCONCURRENT]". Repeatable.
+           Enables multi-target fair scheduling; the positional URL is then
+           ignored. WEIGHT is non-negative and at least one target must have
+           a positive weight. MAXCONCURRENT caps in-flight requests to that
+           target, 0 (default) means no cap.
+           Example: -target "http://host-a 3 10" -target "http://host-b 1".
+  -breaker Circuit-breaker window for failing targets (transport error or
+           5xx) in multi-target mode. A failing target loses all traffic for
+           the window, then receives one probe request; a successful probe
+           restores its weight. 0 disables the circuit breaker.
+           Default is 30s.
 ```
 
 ## Examples

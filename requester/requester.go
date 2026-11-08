@@ -18,6 +18,7 @@ package requester
 import (
 	"bytes"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptrace"
@@ -88,6 +89,18 @@ type Work struct {
 	// Optional.
 	ProxyAddr *url.URL
 
+	// Targets optionally enables multi-target weighted fair scheduling.
+	// When empty, Work behaves exactly like the single-target load
+	// generator and uses Request. When set, requests are dispatched to
+	// the targets according to their weights instead.
+	Targets []Target
+
+	// BreakerWindow is the circuit-breaker window used in multi-target
+	// mode: a failing target loses all traffic for the window and is
+	// then probed once before its weight is restored. Zero disables the
+	// circuit breaker. It has no effect when Targets is empty.
+	BreakerWindow time.Duration
+
 	// Writer is where results will be written. If nil, results are written to stdout.
 	Writer io.Writer
 
@@ -95,6 +108,9 @@ type Work struct {
 	results  chan *result
 	stopCh   chan struct{}
 	start    time.Duration
+
+	// scheduler is the multi-target scheduler, nil in single-target mode.
+	scheduler *Scheduler
 
 	report *report
 }
@@ -132,6 +148,10 @@ func (b *Work) Stop() {
 	// Send stop signal so that workers can stop gracefully.
 	for i := 0; i < b.C; i++ {
 		b.stopCh <- struct{}{}
+	}
+	// Wake up workers blocked inside the multi-target scheduler.
+	if b.scheduler != nil {
+		b.scheduler.Stop()
 	}
 }
 
@@ -236,10 +256,16 @@ func (b *Work) runWorkers() {
 	var wg sync.WaitGroup
 	wg.Add(b.C)
 
+	host := ""
+	if b.Request != nil {
+		host = b.Request.Host
+	} else if len(b.Targets) > 0 {
+		host = b.Targets[0].Request.Host
+	}
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
-			ServerName:         b.Request.Host,
+			ServerName:         host,
 		},
 		MaxIdleConnsPerHost: min(b.C, maxIdleConn),
 		DisableCompression:  b.DisableCompression,
@@ -253,6 +279,11 @@ func (b *Work) runWorkers() {
 	}
 	client := &http.Client{Transport: tr, Timeout: time.Duration(b.Timeout) * time.Second}
 
+	if len(b.Targets) > 0 {
+		b.runMultiTargetWorkers(client, &wg)
+		return
+	}
+
 	// Ignore the case where b.N % b.C != 0.
 	for i := 0; i < b.C; i++ {
 		go func() {
@@ -263,6 +294,123 @@ func (b *Work) runWorkers() {
 	wg.Wait()
 }
 
+// runMultiTargetWorkers runs the workers against the weighted target
+// scheduler instead of a single request.
+func (b *Work) runMultiTargetWorkers(client *http.Client, wg *sync.WaitGroup) {
+	sched, err := NewScheduler(b.Targets, int64(b.N), b.BreakerWindow)
+	if err != nil {
+		fmt.Fprintln(b.writer(), err)
+		for i := 0; i < b.C; i++ {
+			wg.Done()
+		}
+		return
+	}
+	b.scheduler = sched
+
+	for i := 0; i < b.C; i++ {
+		go func() {
+			defer wg.Done()
+			var throttle <-chan time.Time
+			if b.QPS > 0 {
+				ticker := time.NewTicker(time.Duration(1e6/(b.QPS)) * time.Microsecond)
+				defer ticker.Stop()
+				throttle = ticker.C
+			}
+			if b.DisableRedirects {
+				client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				}
+			}
+			for {
+				// Check if application is stopped. Do not send into a closed channel.
+				select {
+				case <-b.stopCh:
+					sched.Stop()
+					return
+				default:
+					if b.QPS > 0 {
+						<-throttle
+					}
+					idx, ok := sched.Next()
+					if !ok {
+						return
+					}
+					code, reqErr := b.makeTargetRequest(client, b.Targets[idx].Request)
+					sched.Complete(idx, requestFailed(reqErr, code))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// requestFailed reports whether a completed request must trip the
+// circuit breaker of its target: transport errors and 5xx responses.
+func requestFailed(err error, statusCode int) bool {
+	return err != nil || statusCode >= 500
+}
+
+// makeTargetRequest performs one request built from the target's
+// template and records its result. It returns the response status code
+// (zero on transport error) and the transport error.
+func (b *Work) makeTargetRequest(c *http.Client, template *http.Request) (int, error) {
+	s := now()
+	var size int64
+	var code int
+	var dnsStart, connStart, resStart, reqStart, delayStart time.Duration
+	var dnsDuration, connDuration, resDuration, reqDuration, delayDuration time.Duration
+	req := cloneRequest(template, b.RequestBody)
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(info httptrace.DNSStartInfo) {
+			dnsStart = now()
+		},
+		DNSDone: func(dnsInfo httptrace.DNSDoneInfo) {
+			dnsDuration = now() - dnsStart
+		},
+		GetConn: func(h string) {
+			connStart = now()
+		},
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			if !connInfo.Reused {
+				connDuration = now() - connStart
+			}
+			reqStart = now()
+		},
+		WroteRequest: func(w httptrace.WroteRequestInfo) {
+			reqDuration = now() - reqStart
+			delayStart = now()
+		},
+		GotFirstResponseByte: func() {
+			delayDuration = now() - delayStart
+			resStart = now()
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	resp, err := c.Do(req)
+	if err == nil {
+		size = resp.ContentLength
+		code = resp.StatusCode
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	t := now()
+	resDuration = t - resStart
+	finish := t - s
+	b.results <- &result{
+		offset:        s,
+		statusCode:    code,
+		duration:      finish,
+		err:           err,
+		contentLength: size,
+		connDuration:  connDuration,
+		dnsDuration:   dnsDuration,
+		reqDuration:   reqDuration,
+		resDuration:   resDuration,
+		delayDuration: delayDuration,
+	}
+	return code, err
+}
+
 // cloneRequest returns a clone of the provided *http.Request.
 func cloneRequest(r *http.Request, body []byte) *http.Request {
 	r2 := r.Clone(r.Context())
@@ -271,4 +419,3 @@ func cloneRequest(r *http.Request, body []byte) *http.Request {
 	}
 	return r2
 }
-
